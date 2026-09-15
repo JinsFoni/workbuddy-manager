@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -323,3 +324,82 @@ class ReleasePackageIncludesDockerAssetsTest(unittest.TestCase):
         for asset in ('Dockerfile', 'docker-compose.yml'):
             self.assertIn(asset, block,
                           f'发布包没打进去 {asset} —— 用户拿到包也用不了容器部署')
+
+
+class MultiArchImageTest(unittest.TestCase):
+    """镜像必须同时支持 amd64 与 arm64。
+
+    两处独立的架构缺陷，都实测过：
+
+      1. **发版流程只构建 amd64**。原先用 `docker build`，它只产出 runner 自身的
+         架构，于是推上去的镜像没有 arm64 变体 —— ARM 机器（Apple Silicon、ARM
+         云主机）拉取时直接报 `no matching manifest for linux/arm64`。
+         必须走 buildx 且 `platforms` 里同时列出两个架构。
+
+      2. **Dockerfile 写死 x86_64 二进制**。安装 docker CLI 时下载地址固定为
+         `.../static/stable/x86_64/...`。即便镜像变成多架构，容器里的 `docker`
+         命令在 ARM 上仍是 x86_64 —— 而**构建期不报错**，要等到真正调用它
+         （重载上游、读上游日志）才失败。这类"坏镜像"最难排查，所以在这里钉死。
+
+    第 2 点尤其容易复发：Docker 自己的架构名（amd64/arm64）与官方静态包的目录名
+    （x86_64/aarch64）**并不一致**，凭直觉写就会写错。
+    """
+
+    def _workflow(self) -> str:
+        return (_ROOT / '.github' / 'workflows' / 'release.yml').read_text(encoding='utf-8')
+
+    def test_workflow_builds_both_architectures(self) -> None:
+        wf = self._workflow()
+        self.assertIn('platforms:', wf, '镜像构建没声明 platforms —— 只会产出单架构')
+        # 取 platforms 那一行，确认两个架构都在
+        line = next((l for l in wf.splitlines() if 'platforms:' in l), '')
+        self.assertIn('linux/amd64', line)
+        self.assertIn('linux/arm64', line,
+                      'arm64 不在 platforms 里 —— ARM 用户拉不到镜像')
+
+    def test_workflow_uses_buildx(self) -> None:
+        """多架构必须走 buildx：普通 `docker build` 无法产出 manifest list。"""
+        wf = self._workflow()
+        self.assertIn('setup-buildx-action', wf)
+        self.assertIn('build-push-action', wf)
+        self.assertIn('setup-qemu-action', wf,
+                      '跨架构构建 arm64 层需要 QEMU（runner 是 amd64）')
+
+    def test_dockerfile_does_not_hardcode_x86_64(self) -> None:
+        df = (_ROOT / 'Dockerfile').read_text(encoding='utf-8')
+        # 只检查 docker CLI 下载那一行：别的注释里出现 x86_64 是正常的（解释用）
+        dl = [l for l in df.splitlines()
+              if 'download.docker.com' in l and not l.lstrip().startswith('#')]
+        self.assertTrue(dl, '找不到 docker CLI 下载行')
+        for line in dl:
+            self.assertNotIn('stable/x86_64', line,
+                             'docker CLI 下载地址写死了 x86_64 —— ARM 上装的是跑不起来的二进制')
+
+    def test_dockerfile_maps_arch_names(self) -> None:
+        """架构名映射必须把 amd64→x86_64、arm64→aarch64 **映射正确**。
+
+        官方静态包目录名与 Docker 架构名不一致，是本项目踩过的坑；这里锁住映射，
+        避免以后有人"顺手简化"成直接用 TARGETARCH。
+
+        注意断言的是 `DOCKER_ARCH=` 的**取值**，而不是"文件里出现过 aarch64"——
+        后者是无效断言：`aarch64` 在 case 模式的左侧也出现，把 arm64 错映射成
+        x86_64 时它照样通过（本测试初版就是这样漏掉的）。
+        """
+        df = (_ROOT / 'Dockerfile').read_text(encoding='utf-8')
+        self.assertIn('TARGETARCH', df, '没使用 buildx 注入的 TARGETARCH')
+
+        # 解析 case 分支：`<patterns>)  DOCKER_ARCH=<value>`
+        mapping = {}
+        for patterns, value in re.findall(
+                r'^\s*([\w\s|]+?)\)\s*DOCKER_ARCH=(\w+)', df, re.M):
+            for name in patterns.split('|'):
+                mapping[name.strip()] = value
+
+        self.assertEqual(mapping.get('amd64'), 'x86_64', f'解析到的映射：{mapping}')
+        self.assertEqual(mapping.get('x86_64'), 'x86_64', f'解析到的映射：{mapping}')
+        self.assertEqual(mapping.get('arm64'), 'aarch64',
+                         f'arm64 没映射到 aarch64 —— ARM 上会装成 x86_64 二进制。'
+                         f'解析到的映射：{mapping}')
+        self.assertEqual(mapping.get('aarch64'), 'aarch64', f'解析到的映射：{mapping}')
+        # 未识别的架构必须构建期失败，而不是产出坏镜像
+        self.assertIn('exit 1', df, '不支持的架构应直接失败')

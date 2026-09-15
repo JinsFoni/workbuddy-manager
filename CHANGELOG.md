@@ -7,6 +7,27 @@
 
 ---
 
+## [未发布]
+
+### 修复
+- **容器镜像不支持 arm64，ARM 机器拉下来用不了**：发版流程用 `docker build` 构建，
+  只产出 runner 自身的架构（amd64），所以 Apple Silicon、ARM 云主机（Oracle、
+  华为鲲鹏等）拉镜像时会直接报 `no matching manifest for linux/arm64`。
+  现已改为用 buildx 同时构建 `linux/amd64` 与 `linux/arm64` 并合并成一个
+  manifest list，`docker pull` 按机器架构自动选择。
+
+  > 同一个问题的第二处：`Dockerfile` 里安装 docker CLI 时把静态包的路径写死成
+  > `x86_64`。而 Docker 官方静态包的目录名与 Docker 自己的架构名并不一致
+  > （amd64→`x86_64`、arm64→`aarch64`），于是即便镜像能拉下来，容器内的
+  > `docker` 命令在 ARM 上也是一个跑不起来的 x86_64 二进制——要等到调用它
+  > （重载上游、读上游日志）时才报「格式错误」。现在按目标架构选包，
+  > 并在无法识别的架构上**构建期直接失败**，而不是产出一个坏镜像。
+
+  > 直接 `docker compose up --build`（不走 CI）的 ARM 用户同样受益：没有 buildx
+  > 时按宿主机架构回退取包，不再需要手工改 Dockerfile。
+
+---
+
 ## [1.0.35] - 2026-09-15
 
 ### 新增
