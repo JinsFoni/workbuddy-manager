@@ -1,0 +1,115 @@
+# 仅构建并推送容器镜像（**本 fork 专用**）
+#
+# 为什么单独一个工作流，而不是复用 release.yml：
+#
+#   1. release.yml 会创建 GitHub Release 并打包 tar.gz，而**签名由维护者在本机
+#      完成**。没有 .sig 的 Release 会被所有用户的一键更新拒绝——在 fork 上做这件事
+#      只会制造一个"看起来能装、实际装不上"的产物。这里刻意不碰 Release。
+#   2. 本工作流产出的是**可用的镜像**，不冒充正式发版：不发 Release、不动版本号、
+#      不参与签名信任链。
+#
+# 关于镜像名（踩过的坑，别改回去）：
+#
+#   原先沿用 `ghcr.io/<owner>/workbuddy-manager`，但该包名在 JinsFoni 命名空间下
+#   已被一个**未链接到本仓库**的包占用，fork 的 GITHUB_TOKEN 对它没有写权限，
+#   推送必然失败：`denied: permission_denied: write_package`。
+#   实测（同一 workflow、同一 token）：换个**新包名**推送成功，且 manifest 里
+#   同时含 linux/amd64 与 linux/arm64。故这里用独立包名，绕开归属问题。
+#   想改用原包名的话，需先到 package 设置里把该包链接到本仓库。
+#
+# 用法：
+#   * 推送到 main 自动构建（改代码后即得新镜像）
+#   * 或手动触发：Actions → Build Image (fork) → Run workflow
+#
+# 拉取：
+#   docker pull ghcr.io/jinsfoni/workbuddy-manager-multiarch:latest
+name: Build Image (fork)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # 推 GHCR 必须显式声明，否则被拒（只给 contents 不够）
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: 构建前端静态导出
+        # 必要：Dockerfile 会 COPY web/out，缺了它镜像里没有界面
+        working-directory: web
+        run: |
+          npm ci
+          npm run build:export
+
+      - name: 校验构建产物
+        run: test -f web/out/index.html || { echo "缺少 web/out/index.html"; exit 1; }
+
+      - name: 读取版本号（用于镜像标签）
+        id: ver
+        run: |
+          V=$(python3 -c "import re;print(re.search(r\"version='([^']+)'\", open('server/main.py',encoding='utf-8').read()).group(1))")
+          echo "version=$V" >> $GITHUB_OUTPUT
+          echo "版本号：$V"
+
+      - name: 设置 QEMU
+        # runner 是 amd64，构建 arm64 层需要它模拟
+        uses: docker/setup-qemu-action@v3
+
+      - name: 设置 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送（amd64 + arm64）
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/workbuddy-manager-multiarch:latest
+            ghcr.io/${{ github.repository_owner }}/workbuddy-manager-multiarch:main
+            ghcr.io/${{ github.repository_owner }}/workbuddy-manager-multiarch:${{ steps.ver.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/workbuddy-manager-multiarch:sha-${{ github.sha }}
+          # 关掉 provenance：它会在 manifest list 里加 unknown/unknown 的 attestation
+          # 条目，旧版 Docker（< 25）拉取时会报错
+          provenance: false
+          # 层缓存走 Actions 缓存，arm64 层靠 QEMU 跑得慢，缓存能省下大部分时间
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 写入构建摘要
+        run: |
+          {
+            echo "## 镜像已推送"
+            echo ""
+            echo '```bash'
+            echo "docker pull ghcr.io/${{ github.repository_owner }}/workbuddy-manager-multiarch:latest"
+            echo '```'
+            echo ""
+            echo "- 平台：\`linux/amd64\`, \`linux/arm64\`（按机器架构自动选择）"
+            echo "- 版本：\`${{ steps.ver.outputs.version }}\`"
+            echo "- digest：\`${{ steps.build.outputs.digest }}\`"
+            echo ""
+            echo "> 本工作流只构建镜像，**不创建 Release、不签名**（签名信任链只覆盖正式发布包）。"
+          } >> $GITHUB_STEP_SUMMARY
