@@ -65,6 +65,16 @@ jobs:
           echo "version=$V" >> $GITHUB_OUTPUT
           echo "版本号：$V"
 
+      - name: 解析镜像名
+        # GHCR 要求仓库名**全小写**，而 repository_owner 可能含大写
+        # （本仓库的 owner 是 JinsFoni）。实测直接用它会被拒：
+        #   invalid tag ".../JinsFoni/...": repository name must be lowercase
+        # build-push-action 的 tags 里做不了 ${VAR,,}，先在这里算好。
+        id: image
+        run: |
+          IMAGE="ghcr.io/${{ github.repository_owner }}/workbuddy-manager-multiarch"
+          echo "name=${IMAGE,,}" >> $GITHUB_OUTPUT
+
       - name: 设置 QEMU
         # runner 是 amd64，构建 arm64 层需要它模拟
         uses: docker/setup-qemu-action@v3
@@ -87,10 +97,10 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/workbuddy-manager-multiarch:latest
-            ghcr.io/${{ github.repository_owner }}/workbuddy-manager-multiarch:main
-            ghcr.io/${{ github.repository_owner }}/workbuddy-manager-multiarch:${{ steps.ver.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/workbuddy-manager-multiarch:sha-${{ github.sha }}
+            ${{ steps.image.outputs.name }}:latest
+            ${{ steps.image.outputs.name }}:main
+            ${{ steps.image.outputs.name }}:${{ steps.ver.outputs.version }}
+            ${{ steps.image.outputs.name }}:sha-${{ github.sha }}
           # 关掉 provenance：它会在 manifest list 里加 unknown/unknown 的 attestation
           # 条目，旧版 Docker（< 25）拉取时会报错
           provenance: false
@@ -104,7 +114,7 @@ jobs:
             echo "## 镜像已推送"
             echo ""
             echo '```bash'
-            echo "docker pull ghcr.io/${{ github.repository_owner }}/workbuddy-manager-multiarch:latest"
+            echo "docker pull ${{ steps.image.outputs.name }}:latest"
             echo '```'
             echo ""
             echo "- 平台：\`linux/amd64\`, \`linux/arm64\`（按机器架构自动选择）"

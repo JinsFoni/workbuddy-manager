@@ -448,3 +448,23 @@ class ForkImageWorkflowTest(unittest.TestCase):
         """推 GHCR 必须显式声明 packages: write，只给 contents 会被拒。"""
         wf = self._wf()
         self.assertIn('packages: write', wf)
+
+    def test_image_tags_are_lowercased(self) -> None:
+        """镜像名必须转小写。
+
+        GHCR 要求仓库名全小写，而 owner 是 `JinsFoni`（含大写）。直接把
+        `github.repository_owner` 拼进 tag 会被拒：
+
+            invalid tag "ghcr.io/JinsFoni/...": repository name must be lowercase
+
+        实测踩过。build-push-action 的 tags 里做不了 `${VAR,,}`，所以必须有一个
+        独立步骤先算好；这里断言 tags 引用的是那个算好的输出，而不是原始 owner。
+        """
+        wf = self._wf()
+        self.assertIn('${IMAGE,,}', wf,
+                      '没有把小写转换步骤 —— GHCR 会拒收含大写的镜像名')
+        # tags 里不能直接出现未转义的 repository_owner
+        tags_block = wf[wf.find('tags:'):]
+        tags_block = tags_block[:tags_block.find('provenance')]
+        self.assertNotIn('github.repository_owner', tags_block,
+                         'tags 里直接用了 repository_owner（含大写）—— 应改用转小写后的输出')
